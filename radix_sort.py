@@ -20,17 +20,26 @@ def wait_for_value(V_ptr, val):
     while tl.atomic_cas(V_ptr, val, val) != val:
         pass
 
+def get_configs():
+    configs = [
+        triton.Config({'BLOCK_SIZE': 2**i, 'INNER_BLOCK_SIZE': 2**j}, num_stages=num_stages, num_warps=num_warps)
+        for i in range(6, 12)
+        for j in range(4, i)
+        for num_stages in [2, 4, 6]
+        for num_warps in [2, 4, 8]
+    ]
+    return configs
+
 @triton.autotune(
-    configs=[
-        # triton.Config({'BLOCK_SIZE': 128}, num_stages=4, num_warps=2),
-        # triton.Config({'BLOCK_SIZE': 512}, num_stages=4, num_warps=2),
-        # triton.Config({'BLOCK_SIZE': 1024}, num_stages=4, num_warps=4),
-        # triton.Config({'BLOCK_SIZE': 2048}, num_stages=4, num_warps=4),
-        # triton.Config({'BLOCK_SIZE': 4096}, num_stages=4, num_warps=4)
-        triton.Config({'BLOCK_SIZE': 8192}, num_stages=4, num_warps=4)
-    ],
+    configs=get_configs(),
     key=['input_size', 'num_experts'],
-    reset_to_zero=['C_ptr', 'C_Lock_ptr', 'C_Count_ptr']
+    reset_to_zero=['C_ptr', 'C_Lock_ptr', 'C_Count_ptr'],
+
+)
+@triton.heuristics(
+    values={
+        'IS_MONOBLOCK': lambda META: META['BLOCK_SIZE'] == META['INNER_BLOCK_SIZE']
+    }
 )
 @triton.jit
 def sort_kernel(
@@ -40,16 +49,28 @@ def sort_kernel(
         input_size: tl.constexpr,
         E_BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-        INNER_BLOCK_SIZE: tl.constexpr):
-    sort_kernel_multiblock(
-        E_ptr, O_ptr, S_ptr,
-        C_ptr, C_Lock_ptr, C_Count_ptr,
-        num_experts,
-        input_size,
-        E_BLOCK_SIZE,
-        BLOCK_SIZE,
-        INNER_BLOCK_SIZE
-    )
+        INNER_BLOCK_SIZE: tl.constexpr,
+        IS_MONOBLOCK: tl.constexpr):
+
+    if IS_MONOBLOCK:
+        sort_kernel_monoblock(
+            E_ptr, O_ptr, S_ptr,
+            C_ptr, C_Lock_ptr, C_Count_ptr,
+            num_experts,
+            input_size,
+            E_BLOCK_SIZE,
+            BLOCK_SIZE,
+        )
+    else:
+        sort_kernel_multiblock(
+            E_ptr, O_ptr, S_ptr,
+            C_ptr, C_Lock_ptr, C_Count_ptr,
+            num_experts,
+            input_size,
+            E_BLOCK_SIZE,
+            BLOCK_SIZE,
+            INNER_BLOCK_SIZE
+        )
 
 
 @triton.jit
@@ -160,7 +181,6 @@ def sort_expert_idxs(expert_idxs, num_experts):
         num_experts,
         input_size,
         E_BLOCK_SIZE,
-        INNER_BLOCK_SIZE=512
     )
 
     return sorted_idxs, argsort_idxs, bincount
