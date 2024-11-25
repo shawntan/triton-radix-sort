@@ -23,10 +23,11 @@ def wait_for_value(V_ptr, val):
 def get_configs():
     configs = [
         triton.Config({'BLOCK_SIZE': 2**i, 'INNER_BLOCK_SIZE': 2**j}, num_stages=num_stages, num_warps=num_warps)
-        for i in range(6, 12)
-        for j in range(4, i)
-        for num_stages in [2, 4, 6]
+        for i in range(10, 14)
+        for j in range(4, i + 1)
+        for num_stages in [2, 4]
         for num_warps in [2, 4, 8]
+        if i <= j
     ]
     return configs
 
@@ -52,8 +53,13 @@ def sort_kernel(
         INNER_BLOCK_SIZE: tl.constexpr,
         IS_MONOBLOCK: tl.constexpr):
 
+    block_id = tl.program_id(0)
+    total_updates = tl.num_programs(0)
+    expert_ids = tl.arange(0, num_experts)
+
     if IS_MONOBLOCK:
         sort_kernel_monoblock(
+            block_id, total_updates, expert_ids,
             E_ptr, O_ptr, S_ptr,
             C_ptr, C_Lock_ptr, C_Count_ptr,
             num_experts,
@@ -63,6 +69,7 @@ def sort_kernel(
         )
     else:
         sort_kernel_multiblock(
+            block_id, total_updates, expert_ids,
             E_ptr, O_ptr, S_ptr,
             C_ptr, C_Lock_ptr, C_Count_ptr,
             num_experts,
@@ -75,17 +82,13 @@ def sort_kernel(
 
 @triton.jit
 def sort_kernel_monoblock(
+        block_id, total_updates, expert_ids,
         E_ptr, O_ptr, S_ptr,
         C_ptr, C_Lock_ptr, C_Count_ptr,
         num_experts: tl.constexpr,
         input_size: tl.constexpr,
         E_BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr):
-
-    block_id = tl.program_id(0)
-    total_updates = tl.num_programs(0)
-    expert_ids = tl.arange(0, num_experts)
-
     in_idxs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     E_ptrs = E_ptr + in_idxs
     E = tl.load(E_ptrs)
@@ -112,6 +115,7 @@ def sort_kernel_monoblock(
 
 @triton.jit
 def sort_kernel_multiblock(
+        block_id, total_updates, expert_ids,
         E_ptr, O_ptr, S_ptr,
         C_ptr, C_Lock_ptr, C_Count_ptr,
         num_experts: tl.constexpr,
@@ -119,9 +123,6 @@ def sort_kernel_multiblock(
         E_BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         INNER_BLOCK_SIZE: tl.constexpr):
-    block_id = tl.program_id(0)
-    total_updates = tl.num_programs(0)
-    expert_ids = tl.arange(0, num_experts)
     iters = BLOCK_SIZE // INNER_BLOCK_SIZE
     E_ptrs = E_ptr + block_id * BLOCK_SIZE + tl.arange(0, INNER_BLOCK_SIZE)
     acc_block_counts = tl.zeros_like(expert_ids)
