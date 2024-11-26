@@ -14,14 +14,13 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, acc, mask, NO_MASK):
     else:
         acc_old = tl.load(A_ptrs, mask=mask)
 
-    acc += acc_old
+    acc_new = acc + acc_old
+    tl.store(A_ptrs, acc_new, mask=mask)
 
-    tl.store(A_ptrs, acc, mask=mask)
-
-    tl.atomic_xchg(Count_ptr, count + 1)
+    new_count = count + 1
+    tl.atomic_xchg(Count_ptr, new_count)
     tl.atomic_xchg(Lock_ptr, 0)
-
-    return acc_old, count
+    return acc_new, acc_old, new_count
 
 @triton.jit
 def wait_for_value(V_ptr, val):
@@ -42,12 +41,9 @@ def get_configs():
 
 @triton.autotune(
     configs=get_configs(),
-    # configs=[
-    #     triton.Config({'BLOCK_SIZE': 8192, 'INNER_BLOCK_SIZE': 1024}, num_stages=4, num_warps=8)
-    # ],
+    # configs=[triton.Config({'BLOCK_SIZE': 4096, 'INNER_BLOCK_SIZE': 1024}, num_stages=4, num_warps=8)],
     key=['input_size', 'num_experts'],
     reset_to_zero=['C_ptr', 'C_Lock_ptr', 'C_Count_ptr'],
-
 )
 @triton.heuristics(
     values={
@@ -126,14 +122,18 @@ def sort_kernel_monoblock(
     indicator = tl.where(mask, 1, 0)
 
     # Add to global bincount and retrieve old accumulator
-    acc, _ = locked_add(C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, tl.sum(indicator, axis=0),
-                        mask=bincount_mask, NO_MASK=NO_E_MASK)
 
+    expert_counts, acc, update_counts = locked_add(
+        C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, tl.sum(indicator, axis=0),
+        mask=bincount_mask, NO_MASK=NO_E_MASK
+    )
     acc += tl.cumsum(indicator, axis=0) # do something before waiting...
-    # Wait for all to report in
-    wait_for_value(C_Count_ptr, total_updates)
-    # Compute global bincount offset [0, exp0_count, ...]
-    expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
+    if update_counts < total_updates:
+        # Wait for all to report in
+        wait_for_value(C_Count_ptr, total_updates)
+        # Compute global bincount offset [0, exp0_count, ...]
+        expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
+
     expert_offset = tl.cumsum(expert_counts, axis=0) - expert_counts
     acc += expert_offset[None, :]
     dest_idxs = tl.where(mask, acc - 1, -1)
@@ -186,16 +186,20 @@ def sort_kernel_multiblock(
     acc_block_counts += tl.sum(indicator, axis=0)
 
     # Add to global bincount and retrieve old accumulator
-    prev_counts, _ = locked_add(C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, acc_block_counts,
-                                mask=bincount_mask, NO_MASK=NO_E_MASK)
+    expert_counts, prev_counts, update_counts = locked_add(
+        C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, acc_block_counts,
+        mask=bincount_mask, NO_MASK=NO_E_MASK
+    )
 
     # Reset pointers while waiting for all to report in
     in_idxs = block_id * BLOCK_SIZE + tl.arange(0, INNER_BLOCK_SIZE) # do something before waiting...
     E_ptrs = E_ptr + in_idxs
-    wait_for_value(C_Count_ptr, total_updates)
 
-    # Compute global bincount offset [0, exp0_count, ...]
-    expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
+    if update_counts < total_updates: # Check if last thread to report.
+        wait_for_value(C_Count_ptr, total_updates)
+        # Compute global bincount offset [0, exp0_count, ...]
+        expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
+
     expert_offset = tl.cumsum(expert_counts, axis=0) - expert_counts + prev_counts
 
     for inner_block_id in tl.range(iters - 1):
@@ -242,12 +246,9 @@ def sort_expert_idxs(expert_idxs, num_experts):
     grid = lambda meta: (triton.cdiv(input_size, meta['BLOCK_SIZE']),)
     sort_kernel[grid](
         expert_idxs,
-        argsort_idxs,
-        sorted_idxs,
+        argsort_idxs, sorted_idxs,
         bincount, bincount_lock, bincount_count,
-        num_experts,
-        input_size,
+        num_experts, input_size,
     )
-
     return sorted_idxs, argsort_idxs, bincount
 

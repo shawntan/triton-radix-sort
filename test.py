@@ -11,8 +11,11 @@ if __name__ == "__main__":
 
     print("Output:")
     assert (count == torch.bincount(expert_idxs)).all()
+    print(20 * '-')
+    print("bincount good.")
     print(count)
     print(torch.bincount(expert_idxs))
+    print(20 * '-')
     assert (sorted_expert_idxs[:-1] <= sorted_expert_idxs[1:]).all()
     print(sorted_expert_idxs)
     assert (sorted_expert_idxs == torch.sort(expert_idxs)[0]).all()
