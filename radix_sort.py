@@ -8,18 +8,24 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, acc, mask, NO_MASK):
     while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
         pass
     count = tl.load(Count_ptr)
-    if count > 0:
+    if count > 0: # don't load if first time.
         if NO_MASK:
             acc_old = tl.load(A_ptrs)
         else:
             acc_old = tl.load(A_ptrs, mask=mask)
 
         acc_new = acc_old + acc
+        new_count = count + 1
     else:
         acc_old = tl.zeros_like(acc)
         acc_new = acc
-    tl.store(A_ptrs, acc_new, mask=mask)
-    new_count = count + 1
+        new_count = 1
+
+    if NO_MASK:
+        tl.store(A_ptrs, acc_new)
+    else:
+        tl.store(A_ptrs, acc_new, mask=mask)
+
     tl.store(Count_ptr, new_count)
     tl.atomic_xchg(Lock_ptr, 0)
     return acc_new, acc_old, new_count
