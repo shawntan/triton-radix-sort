@@ -40,8 +40,8 @@ def get_configs():
     return configs
 
 @triton.autotune(
-    configs=get_configs(),
-    # configs=[triton.Config({'BLOCK_SIZE': 4096, 'INNER_BLOCK_SIZE': 1024}, num_stages=4, num_warps=8)],
+    # configs=get_configs(),
+    configs=[triton.Config({'BLOCK_SIZE': 4096, 'INNER_BLOCK_SIZE': 4096}, num_stages=4, num_warps=8)],
     key=['input_size', 'num_experts'],
     reset_to_zero=['C_ptr', 'C_Lock_ptr', 'C_Count_ptr'],
 )
@@ -119,12 +119,13 @@ def sort_kernel_monoblock(
         E = tl.load(E_ptrs, mask=input_mask, other=num_experts)
 
     mask = E[:, None] == expert_ids[None, :]
-    indicator = tl.where(mask, 1, 0)
+    indicator = mask.to(tl.int16) # tl.where(mask, 1, 0)
+    acc_block_counts = tl.sum(indicator, axis=0)
 
     # Add to global bincount and retrieve old accumulator
 
     expert_counts, acc, update_counts = locked_add(
-        C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, tl.sum(indicator, axis=0),
+        C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, acc_block_counts,
         mask=bincount_mask, NO_MASK=NO_E_MASK
     )
     acc += tl.cumsum(indicator, axis=0) # do something before waiting...
@@ -134,9 +135,8 @@ def sort_kernel_monoblock(
         # Compute global bincount offset [0, exp0_count, ...]
         expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
 
-    expert_offset = tl.cumsum(expert_counts, axis=0) - expert_counts
-    acc += expert_offset[None, :]
-    dest_idxs = tl.where(mask, acc - 1, -1)
+    acc += (tl.cumsum(expert_counts, axis=0) - expert_counts)[None, :] - 1
+    dest_idxs = tl.where(mask, acc, -1)
     dest_idxs_flat = tl.max(dest_idxs, axis=1)
 
     if NO_INPUT_MASK:
@@ -195,7 +195,7 @@ def sort_kernel_multiblock(
     in_idxs = block_id * BLOCK_SIZE + tl.arange(0, INNER_BLOCK_SIZE) # do something before waiting...
     E_ptrs = E_ptr + in_idxs
 
-    if update_counts < total_updates: # Check if last thread to report.
+    if update_counts < total_updates: # If not last thread wait for all to report in.
         wait_for_value(C_Count_ptr, total_updates)
         # Compute global bincount offset [0, exp0_count, ...]
         expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
