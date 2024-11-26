@@ -8,17 +8,19 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, acc, mask, NO_MASK):
     while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
         pass
     count = tl.load(Count_ptr)
+    if count > 0:
+        if NO_MASK:
+            acc_old = tl.load(A_ptrs)
+        else:
+            acc_old = tl.load(A_ptrs, mask=mask)
 
-    if NO_MASK:
-        acc_old = tl.load(A_ptrs)
+        acc_new = acc_old + acc
     else:
-        acc_old = tl.load(A_ptrs, mask=mask)
-
-    acc_new = acc + acc_old
+        acc_old = tl.zeros_like(acc)
+        acc_new = acc
     tl.store(A_ptrs, acc_new, mask=mask)
-
     new_count = count + 1
-    tl.atomic_xchg(Count_ptr, new_count)
+    tl.store(Count_ptr, new_count)
     tl.atomic_xchg(Lock_ptr, 0)
     return acc_new, acc_old, new_count
 
@@ -119,7 +121,7 @@ def sort_kernel_monoblock(
         E = tl.load(E_ptrs, mask=input_mask, other=num_experts)
 
     mask = E[:, None] == expert_ids[None, :]
-    indicator = mask.to(tl.int16) # tl.where(mask, 1, 0)
+    indicator = mask.to(tl.int32) # tl.where(mask, 1, 0)
     acc_block_counts = tl.sum(indicator, axis=0)
 
     # Add to global bincount and retrieve old accumulator
@@ -128,6 +130,7 @@ def sort_kernel_monoblock(
         C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, acc_block_counts,
         mask=bincount_mask, NO_MASK=NO_E_MASK
     )
+
     acc += tl.cumsum(indicator, axis=0) # do something before waiting...
     if update_counts < total_updates:
         # Wait for all to report in
