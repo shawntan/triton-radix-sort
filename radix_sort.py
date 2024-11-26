@@ -30,20 +30,21 @@ def wait_for_value(V_ptr, val):
 
 def get_configs():
     configs = [
-        triton.Config({'BLOCK_SIZE': 2**i, 'INNER_BLOCK_SIZE': 2**j}, num_stages=num_stages, num_warps=num_warps)
-        for i in range(10, 14)
-        for j in range(4, i + 1)
+        triton.Config({'BLOCK_SIZE': 2**i, 'INNER_BLOCK_SIZE': 2**j},
+                      num_stages=num_stages, num_warps=num_warps)
+        for i in range(10, 13)
+        for j in range(8, i + 1)
         for num_stages in [2, 4]
-        for num_warps in [2, 4, 8]
+        for num_warps in [4, 8]
         if i <= j
     ]
     return configs
 
 @triton.autotune(
-    configs=[
-        # triton.Config({'BLOCK_SIZE': 4096, 'INNER_BLOCK_SIZE': 4096}, num_stages=4, num_warps=8)
-        triton.Config({'BLOCK_SIZE': 4096, 'INNER_BLOCK_SIZE': 512}, num_stages=4, num_warps=8)
-    ],
+    configs=get_configs(),
+    # configs=[
+    #     triton.Config({'BLOCK_SIZE': 8192, 'INNER_BLOCK_SIZE': 1024}, num_stages=4, num_warps=8)
+    # ],
     key=['input_size', 'num_experts'],
     reset_to_zero=['C_ptr', 'C_Lock_ptr', 'C_Count_ptr'],
 
@@ -74,6 +75,7 @@ def sort_kernel(
     bincount_mask = expert_ids < num_experts
 
     if IS_MONOBLOCK:
+        NO_INPUT_MASK: tl.constexpr = input_size % BLOCK_SIZE == 0
         sort_kernel_monoblock(
             block_id, total_updates, expert_ids, bincount_mask,
             E_ptr, O_ptr, S_ptr,
@@ -82,8 +84,10 @@ def sort_kernel(
             input_size,
             BLOCK_SIZE,
             E_BLOCK_SIZE, NO_E_MASK,
+            NO_INPUT_MASK=NO_INPUT_MASK and (block_id == tl.num_programs(0) - 1)
         )
     else:
+        NO_INPUT_MASK: tl.constexpr = input_size % INNER_BLOCK_SIZE == 0
         sort_kernel_multiblock(
             block_id, total_updates, expert_ids, bincount_mask,
             E_ptr, O_ptr, S_ptr,
@@ -93,6 +97,7 @@ def sort_kernel(
             BLOCK_SIZE,
             INNER_BLOCK_SIZE,
             E_BLOCK_SIZE, NO_E_MASK,
+            NO_INPUT_MASK=NO_INPUT_MASK and (block_id == tl.num_programs(0) - 1)
         )
 
 
@@ -105,10 +110,17 @@ def sort_kernel_monoblock(
         input_size: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         E_BLOCK_SIZE: tl.constexpr,
-        NO_E_MASK: tl.constexpr):
+        NO_E_MASK: tl.constexpr,
+        NO_INPUT_MASK: tl.constexpr
+    ):
 
     in_idxs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    E = tl.load(E_ptr + in_idxs)
+    E_ptrs = E_ptr + in_idxs
+    if NO_INPUT_MASK:
+        E = tl.load(E_ptrs)
+    else:
+        input_mask = in_idxs < input_size
+        E = tl.load(E_ptrs, mask=input_mask, other=num_experts)
 
     mask = E[:, None] == expert_ids[None, :]
     indicator = tl.where(mask, 1, 0)
@@ -127,8 +139,13 @@ def sort_kernel_monoblock(
     dest_idxs = tl.where(mask, acc - 1, -1)
     dest_idxs_flat = tl.max(dest_idxs, axis=1)
 
-    tl.store(O_ptr + dest_idxs_flat, in_idxs)
-    tl.store(S_ptr + dest_idxs_flat, E)
+    if NO_INPUT_MASK:
+        tl.store(O_ptr + dest_idxs_flat, in_idxs)
+        tl.store(S_ptr + dest_idxs_flat, E)
+    else:
+        input_mask = in_idxs < input_size
+        tl.store(O_ptr + dest_idxs_flat, in_idxs, mask=input_mask)
+        tl.store(S_ptr + dest_idxs_flat, E, mask=input_mask)
 
 
 @triton.jit
@@ -141,18 +158,32 @@ def sort_kernel_multiblock(
         BLOCK_SIZE: tl.constexpr,
         INNER_BLOCK_SIZE: tl.constexpr,
         E_BLOCK_SIZE: tl.constexpr,
-        NO_E_MASK: tl.constexpr):
+        NO_E_MASK: tl.constexpr,
+        NO_INPUT_MASK: tl.constexpr):
 
-    iters = BLOCK_SIZE // INNER_BLOCK_SIZE
+    operating_size = tl.minimum(BLOCK_SIZE, input_size - block_id * BLOCK_SIZE)
+    iters = tl.cdiv(operating_size, INNER_BLOCK_SIZE)
+    in_idxs = block_id * BLOCK_SIZE + tl.arange(0, INNER_BLOCK_SIZE)
+    E_ptrs = E_ptr + in_idxs
 
-    E_ptrs = E_ptr + block_id * BLOCK_SIZE + tl.arange(0, INNER_BLOCK_SIZE)
     acc_block_counts = tl.zeros_like(expert_ids)
-    for inner_block_id in tl.range(iters):
+    for inner_block_id in tl.range(iters - 1):
         E = tl.load(E_ptrs)
         mask = E[:, None] == expert_ids[None, :]
         indicator = tl.where(mask, 1, 0)
         acc_block_counts += tl.sum(indicator, axis=0)
         E_ptrs += INNER_BLOCK_SIZE
+        in_idxs += INNER_BLOCK_SIZE
+
+    if NO_INPUT_MASK:
+        E = tl.load(E_ptrs)
+    else:
+        input_mask = in_idxs < input_size
+        E = tl.load(E_ptrs, mask=input_mask, other=num_experts)
+
+    mask = E[:, None] == expert_ids[None, :]
+    indicator = tl.where(mask, 1, 0)
+    acc_block_counts += tl.sum(indicator, axis=0)
 
     # Add to global bincount and retrieve old accumulator
     prev_counts, _ = locked_add(C_Lock_ptr, C_Count_ptr, C_ptr + expert_ids, acc_block_counts,
@@ -166,24 +197,40 @@ def sort_kernel_multiblock(
     # Compute global bincount offset [0, exp0_count, ...]
     expert_counts = tl.load(C_ptr + expert_ids, mask=bincount_mask) 
     expert_offset = tl.cumsum(expert_counts, axis=0) - expert_counts + prev_counts
-    for inner_block_id in tl.range(iters):
+
+    for inner_block_id in tl.range(iters - 1):
         E = tl.load(E_ptrs)
         mask = E[:, None] == expert_ids[None, :]
         indicator = tl.where(mask, 1, 0)
-
         ptrs = expert_offset + tl.cumsum(indicator, axis=0) - 1
         ptrs = tl.where(mask, ptrs, -1)
         ptrs = tl.max(ptrs, axis=1)
 
         tl.store(O_ptr + ptrs, in_idxs)
         tl.store(S_ptr + ptrs, E)
-        # tl.store(O_ptr + ptrs, in_idxs[:, None], mask=mask)
-        # tl.store(S_ptr + ptrs, E[:, None], mask=mask)
 
         expert_offset += tl.sum(indicator, axis=0)
         E_ptrs += INNER_BLOCK_SIZE
         in_idxs += INNER_BLOCK_SIZE
 
+    E = tl.load(E_ptrs)
+    mask = E[:, None] == expert_ids[None, :]
+    indicator = tl.where(mask, 1, 0)
+    ptrs = expert_offset + tl.cumsum(indicator, axis=0) - 1
+    ptrs = tl.where(mask, ptrs, -1)
+    ptrs = tl.max(ptrs, axis=1)
+
+    if NO_INPUT_MASK:
+        tl.store(O_ptr + ptrs, in_idxs)
+        tl.store(S_ptr + ptrs, E)
+    else:
+        input_mask = in_idxs < input_size
+        tl.store(O_ptr + ptrs, in_idxs, mask=input_mask)
+        tl.store(S_ptr + ptrs, E, mask=input_mask)
+
+
+
+ 
 def sort_expert_idxs(expert_idxs, num_experts):
     input_size = expert_idxs.size(0)
     bincount = torch.zeros(num_experts, dtype=torch.int32, device=expert_idxs.device)
